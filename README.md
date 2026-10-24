@@ -1,7 +1,19 @@
 # Serverless URL Shortener on AWS
+
 A serverless web app for creating short URLs. CloudFront securely (HTTPS) and quickly (CDN) serves the static frontend from a private S3 Bucket. API calls are made through API Gateway and served by Lambda function(s), providing a robust and secure backend, while DynamoDB stores records of links.
 
-![Architecture Diagram](architecture.png)
+```mermaid
+flowchart TD
+    Browser[Browser] --> Domain[go.yourdomain.com]
+    Domain --> CF[CloudFront Distribution]
+
+    CF -->|Static Frontend| S3[(S3 Private Bucket)]
+    CF -->|/api/*| APIGW[API Gateway HTTP API]
+
+    APIGW --> Lambda[Lambda Function]
+    Lambda --> DynamoDB[(DynamoDB Table)]
+    Lambda --> Logs[CloudWatch Logs / Alarms]
+```
 
 ## Architecture
 
@@ -25,12 +37,12 @@ A serverless web app for creating short URLs. CloudFront securely (HTTPS) and qu
 
 ## API Endpoints
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `POST` | `/api/links` | Create a short link |
-| `GET` | `/api/links` | List links |
-| `GET` | `/api/links/{shortCode}` | View link’s metadata |
-| `GET` | `/{shortCode}` | Redirect to the destination URL |
+| Method | Endpoint                 | Purpose                         |
+| ------ | ------------------------ | ------------------------------- |
+| `POST` | `/api/links`             | Create a short link             |
+| `GET`  | `/api/links`             | List links                      |
+| `GET`  | `/api/links/{shortCode}` | View link’s metadata            |
+| `GET`  | `/{shortCode}`           | Redirect to the destination URL |
 
 Example request:
 
@@ -38,3 +50,4 @@ Example request:
 curl -X POST "\$API\_URL/api/links" \\
   -H "Content-Type: application/json" \\
   -d '{"url":"https://example.com","expiresInDays":7}'
+```
