@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless URL Shortener - SMC CS79C Fall 2026
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: url-shortener
+    AllowedPattern: ^[a-z0-9-]+$
+    Description: Lowercase project name used in resource names.
+
+  BudgetAlertEmail:
+    Type: String
+    Description: Email address for the 80 percent monthly budget alert.
+
+  DomainName:
+    Type: String
+    Description: The domain name for the CloudFront distribution.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+    Description: CloudWatch log retention period.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref LinksTable
+        #APP_NAME: !Ref ProjectName
+        DOMAIN_NAME: !Ref DomainName
+
+Resources:
+  # Database
+  LinksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-links-${AWS::AccountId}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: shortCode
+          AttributeType: S
+      KeySchema:
+        - AttributeName: shortCode
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API
+  UrlShortenerApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - Content-Type
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "routeKey":"$context.routeKey","status":"$context.status",
+          "responseLength":"$context.responseLength","integrationError":"$context.integrationErrorMessage"}'
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${ProjectName}-http-api
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Compute/Lambda
+  UrlShortenerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-api
+      CodeUri: app/
+      Handler: handler.lambda_handler
+      Description: Creates and resolves short URLs.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LinksTable
+      Events:
+        CreateShortLink:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UrlShortenerApi
+            Path: /api/links
+            Method: POST
+
+        GetLinkMetadata:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UrlShortenerApi
+            Path: /api/links/{shortCode}
+            Method: GET
+
+        RedirectShortLink:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref UrlShortenerApi
+            Path: /{shortCode}
+            Method: GET
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-lambda-errors
+      AlarmDescription: Alarm if Lambda has one or more errors in five minutes.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref UrlShortenerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # Static Font-end Hosting
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-frontend-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${ProjectName}-s3-oac
+        Description: Allows CloudFront, not the public internet, to read frontend files.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${ProjectName} frontend and API distribution
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+
+        Origins:
+          - Id: S3FrontendOrigin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub ${UrlShortenerApi}.execute-api.${AWS::Region}.amazonaws.com
+            OriginPath: /prod
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+
+        DefaultCacheBehavior:
+          TargetOriginId: S3FrontendOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+
+        CacheBehaviors:
+          # API calls must not be cached.
+          - PathPattern: /api/*
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - HEAD
+              - DELETE
+              - POST
+              - GET
+              - OPTIONS
+              - PUT
+              - PATCH
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            ForwardedValues:
+              QueryString: true
+              Headers:
+                - Content-Type
+                - Origin
+                - Access-Control-Request-Headers
+                - Access-Control-Request-Method
+              Cookies:
+                Forward: none
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 0
+
+          # Don't cache short-code redirects while building/testing.
+          - PathPattern: /??????
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 0
+
+  # Budget Alert
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${ProjectName}-monthly-budget
+        BudgetLimit:
+          Amount: 5
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref BudgetAlertEmail
+
+Outputs:
+  ApiGatewayUrl:
+    Description: Direct API Gateway endpoint.
+    Value: !Sub https://${UrlShortenerApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiUrl
+
+  CloudFrontUrl:
+    Description: Frontend URL. Use this before connecting your custom domain.
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+
+  FrontendBucketName:
+    Description: Upload frontend files to this private bucket.
+    Value: !Ref FrontendBucket
+
+  DynamoDBTableName:
+    Description: DynamoDB table that stores short links.
+    Value: !Ref LinksTable
+
+  LambdaFunctionName:
+    Description: Lambda function name.
+    Value: !Ref UrlShortenerFunction
+
+  CloudFrontDistributionId:
+    Description: Use for CloudFront cache invalidations.
+    Value: !Ref CloudFrontDistribution

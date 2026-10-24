@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>URL Shortener</title>
+  </head>
+  <body>
+    <main>
+      <img src="/logo.png" alt="URL Shortener Logo" width="65" />
+      <h1>AWS Serverless URL Shortener</h1>
+      <h2>CS79C Fall 2026 Final Project</h2>
+      <form id="shorten-form">
+        <label>
+          Destination URL
+          <input id="url" type="url" placeholder="https://smc.edu" required />
+        </label>
+        <button type="submit">Shorten URL</button>
+      </form>
+      <p id="result"></p>
+    </main>
+
+    <footer>Built by Shahab (Shay) Yarmohammadi</footer>
+
+    <script>
+      const form = document.getElementById("shorten-form");
+      const result = document.getElementById("result");
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+
+        const response = await fetch("/api/links", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url: document.getElementById("url").value,
+            expiresInDays: 7,
+          }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          result.textContent = data.message || "Something went wrong.";
+          return;
+        }
+
+        result.innerHTML = `Short URL: <a href="${data.shortUrl}">${data.shortUrl}</a>`;
+      });
+    </script>
+  </body>
+</html>
